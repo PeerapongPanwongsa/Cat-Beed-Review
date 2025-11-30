@@ -1,0 +1,339 @@
+package infoDB
+
+
+import (
+	"encoding/json"
+	"fmt"
+	"log"
+	"strings"
+	"time"
+
+	"github.com/gin-gonic/gin"
+	"github.com/golang-jwt/jwt/v5"
+	"golang.org/x/crypto/bcrypt"
+)
+
+
+type User struct {
+	ID           int       `json:"id"`
+	Username     string    `json:"username"`
+	Email        string    `json:"email"`
+	PasswordHash string    `json:"-"`
+	IsActive     bool      `json:"is_active"`
+	CreatedAt    time.Time `json:"created_at"`
+}
+
+type UserInfo struct {
+	ID       int      `json:"id"`
+	Username string   `json:"username"`
+	Email    string   `json:"email"`
+	Roles    []string `json:"roles"`
+}
+
+type UserBaseInfo struct {
+	ID       int    `json:"id"`
+	Username string `json:"username"`
+	Email    string `json:"email"`
+}
+
+
+type RegisterRequest struct {
+	Username string `json:"username" binding:"required,min=3,max=50"`
+	Email    string `json:"email" binding:"required,email"`
+	Password string `json:"password" binding:"required,min=3"`
+	Role     string `json:"role"`
+}
+
+type LoginRequest struct {
+	Username string `json:"username" binding:"required"`
+	Password string `json:"password" binding:"required"`
+}
+
+type RefreshRequest struct {
+	RefreshToken string `json:"refresh_token" binding:"required"`
+}
+
+type CustomClaims struct {
+	UserID   int      `json:"user_id"`
+	Username string   `json:"username"`
+	Roles    []string `json:"roles"`
+	jwt.RegisteredClaims
+}
+
+
+var jwtSecret = []byte("my-super-secret-key-change-in-production-2024")
+
+func SetJWTSecret(secret string) {
+	jwtSecret = []byte(secret)
+}
+
+
+func HashPassword(password string) (string, error) {
+	hash, err := bcrypt.GenerateFromPassword([]byte(password), 12)
+	if err != nil {
+		return "", err
+	}
+	return string(hash), nil
+}
+
+func VerifyPassword(hashedPassword, password string) error {
+	return bcrypt.CompareHashAndPassword([]byte(hashedPassword), []byte(password))
+}
+
+
+func GenerateAccessToken(userID int, username string, roles []string) (string, error) {
+
+	expirationTime := time.Now().Add(15 * time.Minute)
+	claims := &CustomClaims{
+		UserID:   userID,
+		Username: username,
+		Roles:    roles,
+		RegisteredClaims: jwt.RegisteredClaims{
+			ExpiresAt: jwt.NewNumericDate(expirationTime),
+			IssuedAt:  jwt.NewNumericDate(time.Now()),
+			Issuer:    "bookstore-api",
+		},
+	}
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	return token.SignedString(jwtSecret)
+}
+
+func GenerateRefreshToken(userID int, username string) (string, error) {
+
+	expirationTime := time.Now().Add(7 * 24 * time.Hour)
+	claims := &CustomClaims{
+		UserID:   userID,
+		Username: username,
+		Roles:    []string{},
+		RegisteredClaims: jwt.RegisteredClaims{
+			ExpiresAt: jwt.NewNumericDate(expirationTime),
+			IssuedAt:  jwt.NewNumericDate(time.Now()),
+			Issuer:    "bookstore-api",
+		},
+	}
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	return token.SignedString(jwtSecret)
+}
+
+func VerifyToken(tokenString string) (*CustomClaims, error) {
+
+	token, err := jwt.ParseWithClaims(tokenString, &CustomClaims{}, func(token *jwt.Token) (interface{}, error) {
+		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
+			return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
+		}
+		return jwtSecret, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	if claims, ok := token.Claims.(*CustomClaims); ok && token.Valid {
+		return claims, nil
+	}
+	return nil, fmt.Errorf("invalid token")
+}
+
+
+
+
+func CreateUser(req RegisterRequest) (User, error) {
+
+	hashedPassword, err := HashPassword(req.Password)
+	if err != nil {
+		return User{}, fmt.Errorf("failed to hash password: %w", err)
+	}
+
+	tx, err := db.Begin()
+	if err != nil {
+		return User{}, err
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			tx.Rollback()
+			panic(r)
+		} else if err != nil {
+			tx.Rollback()
+		} else {
+			err = tx.Commit()
+		}
+	}()
+
+
+	var newUser User
+	err = tx.QueryRow(`
+		INSERT INTO users (username, email, password_hash, is_active)
+		VALUES ($1, $2, $3, TRUE)
+		RETURNING id, username, email, is_active, created_at
+	`, req.Username, req.Email, hashedPassword).Scan(
+		&newUser.ID, &newUser.Username, &newUser.Email, &newUser.IsActive, &newUser.CreatedAt,
+	)
+	if err != nil {
+
+		if strings.Contains(err.Error(), "duplicate key value") {
+			return User{}, fmt.Errorf("username or email already exists")
+		}
+		return User{}, err
+	}
+
+
+	defaultRole := "user"
+
+	_, err = tx.Exec(`
+		INSERT INTO user_roles (user_id, role_id)
+		SELECT $1, id FROM roles WHERE name = $2
+	`, newUser.ID, defaultRole)
+
+	if err != nil {
+		return User{}, fmt.Errorf("failed to assign default role: %w", err)
+	}
+
+	return newUser, nil
+}
+
+
+func GetUserByUsername(username string) (User, error) {
+
+	var user User
+	query := `SELECT id, username, email, password_hash, is_active, created_at 
+			  FROM users WHERE username = $1`
+
+	err := db.QueryRow(query, username).Scan(
+		&user.ID,
+		&user.Username,
+		&user.Email,
+		&user.PasswordHash,
+		&user.IsActive,
+		&user.CreatedAt,
+	)
+
+	return user, err
+}
+
+
+func GetUserBaseInfoByID(userID int) (UserBaseInfo, error) {
+
+	var info UserBaseInfo
+	query := `SELECT id, username, email FROM users WHERE id = $1`
+
+	err := db.QueryRow(query, userID).Scan(
+		&info.ID,
+		&info.Username,
+		&info.Email,
+	)
+	return info, err
+}
+
+
+func GetUserRoles(userID int) ([]string, error) {
+
+	query := `
+		SELECT r.name
+		FROM roles r
+		JOIN user_roles ur ON r.id = ur.role_id
+		WHERE ur.user_id = $1
+	`
+	rows, err := db.Query(query, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var roles []string
+	for rows.Next() {
+		var role string
+		if err := rows.Scan(&role); err != nil {
+			return nil, err
+		}
+		roles = append(roles, role)
+	}
+	return roles, nil
+}
+
+
+func CheckUserPermission(userID int, permission string) bool {
+
+	query := `
+		SELECT COUNT(*)
+		FROM permissions p
+		JOIN role_permissions rp ON p.id = rp.permission_id
+		JOIN user_roles ur ON rp.role_id = ur.role_id
+		WHERE ur.user_id = $1 AND p.name = $2
+	`
+	var count int
+	err := db.QueryRow(query, userID, permission).Scan(&count)
+	if err != nil {
+		log.Printf("Error checking permission: %v", err)
+		return false
+	}
+	return count > 0
+}
+
+
+func UpdateLastLogin(userID int) error {
+
+	query := `UPDATE users SET last_login = NOW() WHERE id = $1`
+	_, err := db.Exec(query, userID)
+	return err
+}
+
+
+func StoreRefreshToken(userID int, token string, expiresAt time.Time) error {
+	query := `
+		INSERT INTO refresh_tokens (user_id, token, expires_at)
+		VALUES ($1, $2, $3)
+	`
+	_, err := db.Exec(query, userID, token, expiresAt)
+	return err
+}
+
+
+func RevokeRefreshToken(token string) error {
+	query := `
+		UPDATE refresh_tokens
+		SET revoked_at = NOW()
+		WHERE token = $1 AND revoked_at IS NULL
+	`
+	_, err := db.Exec(query, token)
+	return err
+}
+
+
+func IsRefreshTokenValid(token string) (int, bool) {
+	query := `
+		SELECT user_id
+		FROM refresh_tokens
+		WHERE token = $1
+		AND expires_at > NOW()
+		AND revoked_at IS NULL
+	`
+	var userID int
+	err := db.QueryRow(query, token).Scan(&userID)
+	if err != nil {
+		return 0, false
+	}
+	return userID, true
+}
+
+
+func LogAudit(userID int, action, resource string, resourceID interface{}, details map[string]interface{}, c *gin.Context) {
+	detailsJSON, _ := json.Marshal(details)
+	query := `
+		INSERT INTO audit_logs
+		(user_id, action, resource, resource_id, details, ip_address, user_agent)
+		VALUES ($1, $2, $3, $4, $5, $6, $7)
+	`
+
+	var resourceIDStr string
+	if resourceID != nil {
+		resourceIDStr = fmt.Sprintf("%v", resourceID)
+	}
+
+	db.Exec(query,
+		userID,
+		action,
+		resource,
+		resourceIDStr,
+		detailsJSON,
+		c.ClientIP(),
+		c.GetHeader("User-Agent"),
+	)
+}
